@@ -17,6 +17,9 @@ extern "C" extern int device_map[8];
 // aus heavy.cu
 extern cudaError_t MyStreamSynchronize(cudaStream_t stream, int situation, int thr_id);
 
+static uint32_t *d_nonce[8];
+__constant__ uint32_t pTarget[8];
+
 // Take a look at: https://www.schneier.com/skein1.3.pdf
 
 #if __CUDA_ARCH__ >= 350
@@ -421,14 +424,133 @@ __global__ void quark_skein512_gpu_hash_64(int threads, uint32_t startNounce, ui
 	}
 }
 
+__global__ void quark_skein512_gpu_hash_64_final(int threads, uint32_t startNounce, uint64_t *g_hash, uint32_t *g_nonceVector, uint32_t *d_nonce)
+{
+	int thread = (blockDim.x * blockIdx.x + threadIdx.x);
+	if (thread < threads)
+	{
+		// Skein
+		uint64_t p[8];
+		uint64_t h0, h1, h2, h3, h4, h5, h6, h7, h8;
+		uint64_t t0, t1, t2;
+
+		uint32_t nounce = (g_nonceVector != NULL) ? g_nonceVector[thread] : (startNounce + thread);
+
+		int hashPosition = nounce - startNounce;
+		uint64_t *inpHash = &g_hash[8 * hashPosition];
+
+		// Initialisierung
+		h0 = d_constMem[0];
+		h1 = d_constMem[1];
+		h2 = d_constMem[2];
+		h3 = d_constMem[3];
+		h4 = d_constMem[4];
+		h5 = d_constMem[5];
+		h6 = d_constMem[6];
+		h7 = d_constMem[7];
+
+		// 1. Runde -> etype = 480, ptr = 64, bcount = 0, data = msg		
+#pragma unroll 8
+		for(int i=0;i<8;i++)
+			p[i] = inpHash[i];
+
+		t0 = 64; // ptr
+		t1 = 480ull << 55; // etype
+		TFBIG_KINIT(h0, h1, h2, h3, h4, h5, h6, h7, h8, t0, t1, t2);
+		TFBIG_4e(0);
+		TFBIG_4o(1);
+		TFBIG_4e(2);
+		TFBIG_4o(3);
+		TFBIG_4e(4);
+		TFBIG_4o(5);
+		TFBIG_4e(6);
+		TFBIG_4o(7);
+		TFBIG_4e(8);
+		TFBIG_4o(9);
+		TFBIG_4e(10);
+		TFBIG_4o(11);
+		TFBIG_4e(12);
+		TFBIG_4o(13);
+		TFBIG_4e(14);
+		TFBIG_4o(15);
+		TFBIG_4e(16);
+		TFBIG_4o(17);
+		TFBIG_ADDKEY(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], h, t, 18);
+
+		h0 = inpHash[0] ^ p[0];
+		h1 = inpHash[1] ^ p[1];
+		h2 = inpHash[2] ^ p[2];
+		h3 = inpHash[3] ^ p[3];
+		h4 = inpHash[4] ^ p[4];
+		h5 = inpHash[5] ^ p[5];
+		h6 = inpHash[6] ^ p[6];
+		h7 = inpHash[7] ^ p[7];
+
+		// 2. Runde -> etype = 510, ptr = 8, bcount = 0, data = 0
+#pragma unroll 8
+		for(int i=0;i<8;i++)
+			p[i] = 0;
+
+		t0 = 8; // ptr
+		t1 = 510ull << 55; // etype
+		TFBIG_KINIT(h0, h1, h2, h3, h4, h5, h6, h7, h8, t0, t1, t2);
+		TFBIG_4e(0);
+		TFBIG_4o(1);
+		TFBIG_4e(2);
+		TFBIG_4o(3);
+		TFBIG_4e(4);
+		TFBIG_4o(5);
+		TFBIG_4e(6);
+		TFBIG_4o(7);
+		TFBIG_4e(8);
+		TFBIG_4o(9);
+		TFBIG_4e(10);
+		TFBIG_4o(11);
+		TFBIG_4e(12);
+		TFBIG_4o(13);
+		TFBIG_4e(14);
+		TFBIG_4o(15);
+		TFBIG_4e(16);
+		TFBIG_4o(17);
+		TFBIG_ADDKEY(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], h, t, 18);
+
+		int position = -1;
+		bool rc = true;
+
+#pragma unroll 8
+		for (int i = 7; i >= 0; i--) {
+			if (((uint32_t *)p)[i] > pTarget[i]) {
+				if(position < i) {
+					position = i;
+					rc = false;
+				}
+	 		}
+	 		if (((uint32_t *)p)[i] < pTarget[i]) {
+				if(position < i) {
+					position = i;
+					rc = true;
+				}
+	 		}
+		}
+
+		if(rc == true)
+				d_nonce[0] = nounce;
+    }
+}
+
 // Setup-Funktionen
 __host__ void quark_skein512_cpu_init(int thr_id, int threads)
 {
-	// nix zu tun ;-)
+	cudaMalloc(&d_nonce[thr_id], sizeof(uint32_t));
 	cudaMemcpyToSymbol( d_constMem,
                         h_constMem,
                         sizeof(h_constMem),
                         0, cudaMemcpyHostToDevice);
+}
+
+__host__ void quark_skein512_cpu_setTarget(const void *ptarget)
+{
+	cudaMemcpyToSymbol( pTarget, ptarget, 8*sizeof(uint32_t), 0, cudaMemcpyHostToDevice);
 }
 
 __host__ void quark_skein512_cpu_hash_64(int thr_id, int threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash, int order)
@@ -447,3 +569,27 @@ __host__ void quark_skein512_cpu_hash_64(int thr_id, int threads, uint32_t start
 	// Strategisches Sleep Kommando zur Senkung der CPU Last
 	MyStreamSynchronize(NULL, order, thr_id);
 }
+
+__host__ uint32_t quark_skein512_cpu_hash_64_final(int thr_id, int threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash, int order)
+{
+	const int threadsperblock = 128;
+
+	// berechne wie viele Thread Blocks wir brauchen
+	dim3 grid((threads + threadsperblock-1)/threadsperblock);
+	dim3 block(threadsperblock);
+
+    cudaMemset(d_nonce[thr_id], 0xffffffff, sizeof(uint32_t));
+
+	// Größe des dynamischen Shared Memory Bereichs
+	size_t shared_size = 0;
+
+	quark_skein512_gpu_hash_64_final<<<grid, block, shared_size>>>(threads, startNounce, (uint64_t*)d_hash, d_nonceVector, d_nonce[thr_id]);
+
+	// Strategisches Sleep Kommando zur Senkung der CPU Last
+	MyStreamSynchronize(NULL, order, thr_id);
+
+    uint32_t res;
+    cudaMemcpy(&res, d_nonce[thr_id], sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    return res;
+}
+
