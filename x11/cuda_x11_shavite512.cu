@@ -1,17 +1,16 @@
+#include <stdint.h>
+
 // aus heavy.cu
 extern cudaError_t MyStreamSynchronize(cudaStream_t stream, int situation, int thr_id);
 
 typedef unsigned char BitSequence;
 typedef unsigned long long DataLength;
 
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-
 #define SPH_C64(x)    ((uint64_t)(x ## ULL))
 #define SPH_C32(x)    ((uint32_t)(x ## U))
 #define SPH_T32(x)    ((x) & SPH_C32(0xFFFFFFFF))
+
+__constant__ uint32_t c_PaddedMessage80[32]; // padded message (80 bytes + padding)
 
 static __constant__ uint32_t d_ShaviteInitVector[16];
 static const uint32_t h_ShaviteInitVector[] = {
@@ -22,6 +21,11 @@ static const uint32_t h_ShaviteInitVector[] = {
 };
 
 #include "cuda_x11_aes.cu"
+
+static __device__ uint32_t cuda_swab32(uint32_t x)
+{
+	return __byte_perm(x, 0, 0x0123);
+}
 
 static __device__ __forceinline__ void AES_ROUND_NOKEY(
 	const uint32_t* __restrict__ sharedMemory,
@@ -54,7 +58,7 @@ static __device__ __forceinline__ void KEY_EXPAND_ELT(
 }
 
 static __device__ void
-c512(const uint32_t* sharedMemory, uint32_t *state, uint32_t *msg)
+c512(const uint32_t* sharedMemory, uint32_t *state, uint32_t *msg, uint32_t count)
 {
 	uint32_t p0, p1, p2, p3, p4, p5, p6, p7;
 	uint32_t p8, p9, pA, pB, pC, pD, pE, pF;
@@ -63,7 +67,7 @@ c512(const uint32_t* sharedMemory, uint32_t *state, uint32_t *msg)
 	uint32_t rk08, rk09, rk0A, rk0B, rk0C, rk0D, rk0E, rk0F;
 	uint32_t rk10, rk11, rk12, rk13, rk14, rk15, rk16, rk17;
 	uint32_t rk18, rk19, rk1A, rk1B, rk1C, rk1D, rk1E, rk1F;
-	const uint32_t counter = 512;
+	const uint32_t counter = count;
 
 	p0 = state[0x0];
 	p1 = state[0x1];
@@ -1298,6 +1302,47 @@ c512(const uint32_t* sharedMemory, uint32_t *state, uint32_t *msg)
 	state[0xF] ^= p7;
 }
 
+__global__ void x11_shavite512_gpu_hash_80(int threads, uint32_t startNounce, void *outputHash)
+{
+	__shared__ uint32_t sharedMemory[1024];
+
+	        aes_gpu_init(sharedMemory);	
+  
+
+    int thread = (blockDim.x * blockIdx.x + threadIdx.x);
+    if (thread < threads)
+    {
+		uint32_t nounce = startNounce + thread;
+	
+		// kopiere init-state
+		uint32_t state[16];
+
+
+#pragma unroll 16
+		for(int i=0;i<16;i++) {
+			state[i] = d_ShaviteInitVector[i];}
+
+		uint32_t msg[32];
+
+#pragma unroll 32
+		for(int i=0;i<32;i++) {			
+			msg[i]  = c_PaddedMessage80[i];}
+		    msg[19] = cuda_swab32(nounce);
+			msg[20] = 0x80;
+			msg[27] = 0x2800000;
+			msg[31] = 0x2000000;
+
+		c512(sharedMemory, state, msg,640);
+
+uint32_t *outHash = (uint32_t *)outputHash + 16 * thread;
+
+#pragma unroll 16
+		for(int i=0;i<16;i++)
+			outHash[i] = state[i];
+
+
+	} //thread < threads
+}
 
 // Die Hash-Funktion
 __global__ void x11_shavite512_gpu_hash_64(int threads, uint32_t startNounce, uint64_t *g_hash, uint32_t *g_nonceVector)
@@ -1341,7 +1386,7 @@ __global__ void x11_shavite512_gpu_hash_64(int threads, uint32_t startNounce, ui
 		msg[30] = 0;
 		msg[31] = 0x02000000;
 
-		c512(sharedMemory, state, msg);
+		c512(sharedMemory, state, msg, 512);
 
 #pragma unroll 16
 		for(int i=0;i<16;i++)
@@ -1372,9 +1417,32 @@ __host__ void x11_shavite512_cpu_hash_64(int thr_id, int threads, uint32_t start
     // Größe des dynamischen Shared Memory Bereichs
     size_t shared_size = 0;
 
-//    fprintf(stderr, "threads=%d, %d blocks, %d threads per block, %d bytes shared\n", threads, grid.x, block.x, shared_size);
-
     x11_shavite512_gpu_hash_64<<<grid, block, shared_size>>>(threads, startNounce, (uint64_t*)d_hash, d_nonceVector);
     MyStreamSynchronize(NULL, order, thr_id);
+}
+
+__host__ void x11_shavite512_cpu_hash_80(int thr_id, int threads, uint32_t startNounce, uint32_t *d_outputHash, int order)
+{
+	const int threadsperblock = 256;
+
+	// berechne wie viele Thread Blocks wir brauchen
+	dim3 grid((threads + threadsperblock-1)/threadsperblock);
+	dim3 block(threadsperblock);
+
+	size_t shared_size = 0;
+
+	x11_shavite512_gpu_hash_80<<<grid, block, shared_size>>>(threads, startNounce, d_outputHash);
+
+	MyStreamSynchronize(NULL, order, thr_id);
+}
+__host__ void x11_shavite512_setBlock_80(void *pdata)
+{
+	// Message mit Padding bereitstellen
+	// lediglich die korrekte Nonce ist noch ab Byte 76 einzusetzen.
+	unsigned char PaddedMessage[128];
+	memcpy(PaddedMessage, pdata, 80);
+	memset(PaddedMessage+80, 0, 48);
+	
+	cudaMemcpyToSymbol( c_PaddedMessage80, PaddedMessage, 32*sizeof(uint32_t), 0, cudaMemcpyHostToDevice);
 }
 
